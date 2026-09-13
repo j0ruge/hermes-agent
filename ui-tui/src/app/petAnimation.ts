@@ -3,15 +3,6 @@ import type { PetState } from './usePet.js'
 /** Cadence used when the gateway did not send a usable `frameMs`. */
 export const FRAME_MS = 160
 
-/**
- * States that play once and then go quiet. `idle` is the pet's resting pose —
- * its row is specified as a calm, low-distraction beat, so looping it forever
- * turns the corner of the terminal into a permanent flicker during long
- * sessions. Every other state is a live read-out of what the agent is doing and
- * keeps cycling for as long as it holds.
- */
-const ONE_SHOT_STATES = new Set<PetState>(['idle'])
-
 export interface PetFrameSet {
   count: number
   frameMs?: number
@@ -20,8 +11,8 @@ export interface PetFrameSet {
 export interface PetAnimationStep {
   /** Cursor to feed back into the next call. */
   cursor: number
-  /** Delay before the next tick, or null once the animation has settled. */
-  delayMs: number | null
+  /** Delay before the next tick. */
+  delayMs: number
   /** Frame to paint now, or null while this state's frames are still loading. */
   index: number | null
 }
@@ -34,12 +25,13 @@ export function frameDelayMs(frameMs?: number): number {
 /**
  * The whole animation policy, as a pure step: given the state, the cursor the
  * previous tick handed back and the frames on hand, say what to paint and when
- * (or whether) to tick again.
+ * to tick again. Mirrors `agent/pet/state.py::next_frame_step`.
  *
- * A one-shot state walks 0..n-1, paints the first frame once more and settles
- * there — `delayMs: null` tells the caller to stop scheduling, so the pet holds
- * frame one instead of freezing on the last frame of the cycle. Re-entering the
- * state resets the cursor, which is what buys it a fresh single cycle.
+ * Every row loops; what separates them is the cadence the gateway sends with
+ * the frames (`idle` breathes at roughly one loop every four seconds, the rows
+ * that report live work stay near one second). The null index is the branch
+ * that matters here: a state whose frames are still loading must keep the
+ * painted frame up rather than blank the pet.
  */
 export function nextAnimationStep(state: PetState, cursor: number, frames: PetFrameSet | null): PetAnimationStep {
   const count = frames?.count ?? 0
@@ -49,17 +41,7 @@ export function nextAnimationStep(state: PetState, cursor: number, frames: PetFr
     return { cursor, delayMs: FRAME_MS, index: null }
   }
 
-  const delayMs = frameDelayMs(frames?.frameMs)
+  const index = cursor % count
 
-  if (!ONE_SHOT_STATES.has(state)) {
-    const index = cursor % count
-
-    return { cursor: index + 1, delayMs, index }
-  }
-
-  if (cursor < count) {
-    return { cursor: cursor + 1, delayMs, index: cursor }
-  }
-
-  return { cursor: count, delayMs: null, index: 0 }
+  return { cursor: index + 1, delayMs: frameDelayMs(frames?.frameMs), index }
 }

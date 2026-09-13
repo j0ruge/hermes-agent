@@ -1,61 +1,85 @@
-"""The animation policy: which frame to paint, and whether to keep ticking.
+"""A linha de animação: qual quadro pintar, e em que ritmo.
 
-`idle` is the resting row — it holds the corner of the screen while nothing
-happens, so looping it forever is a permanent flicker. It plays one cycle and
-settles on the first frame; the live-readout rows keep cycling.
+`idle` é a linha de repouso — fica na tela justamente quando nada acontece. Ela
+cicla como as outras, mas numa cadência de respiração (~4,4s a volta) em vez do
+~1s dos estados que são leitura ao vivo do que o agente faz.
 """
 
 from __future__ import annotations
 
 import pytest
 
-from agent.pet.constants import PetState
-from agent.pet.state import next_frame_step
+from agent.pet.constants import LOOP_MS, MAX_FRAME_MS, PetState, loop_ms_for
+from agent.pet.state import frame_interval_ms, next_frame_step, ticks_for
+
+CLI_TICK_S = 0.16
 
 
-def _play(state, count, ticks=24):
-    """Walk the policy the way a render loop does: paint, carry the cursor, stop."""
-    painted, cursor, settled = [], 0, False
+def _play(state, count, ticks=14):
+    """Anda a política como um render loop faz: pinta, carrega o cursor."""
+    painted, cursor = [], 0
     for _ in range(ticks):
         step = next_frame_step(state, cursor, count)
         painted.append(step.index)
         cursor = step.cursor
-        if not step.animating:
-            settled = True
-            break
-    return painted, cursor, settled
+    return painted
 
 
-def test_no_frames_yet_paints_nothing_and_keeps_ticking():
+def test_no_frames_yet_paints_nothing_and_keeps_the_painted_frame():
     step = next_frame_step(PetState.IDLE, 3, 0)
-    assert (step.index, step.cursor, step.animating) == (None, 3, True)
+    assert (step.index, step.cursor) == (None, 3)
 
 
-def test_idle_plays_one_cycle_then_rests_on_the_first_frame():
-    painted, cursor, settled = _play(PetState.IDLE, 6)
-    assert painted == [0, 1, 2, 3, 4, 5, 0]
-    assert (cursor, settled) == (6, True)
+@pytest.mark.parametrize("state", list(PetState))
+def test_every_row_loops(state):
+    assert _play(state, 3, ticks=7) == [0, 1, 2, 0, 1, 2, 0]
 
 
-def test_idle_stays_on_the_first_frame_for_any_later_cursor():
-    for cursor in (6, 7, 99):
-        step = next_frame_step(PetState.IDLE, cursor, 6)
-        assert (step.index, step.cursor, step.animating) == (0, 6, False)
+@pytest.mark.parametrize("count", [1, 2, 6, 8])
+def test_the_loop_closes_whatever_the_frame_count(count):
+    painted = _play(PetState.IDLE, count, ticks=count * 2)
+    assert painted == list(range(count)) * 2
 
 
-@pytest.mark.parametrize("count", [1, 2, 5, 9])
-def test_idle_settles_whatever_the_frame_count(count):
-    painted, _, settled = _play(PetState.IDLE, count)
-    assert settled is True
-    assert painted[-1] == 0
-    assert len(painted) == count + 1
+def test_idle_breathes_slower_than_the_live_readout_rows():
+    assert loop_ms_for("idle") == 4800
+    assert loop_ms_for("run") == LOOP_MS
+    assert loop_ms_for("review") == LOOP_MS
 
 
-@pytest.mark.parametrize(
-    "state",
-    [PetState.RUN, PetState.REVIEW, PetState.WAITING, PetState.WAVE, PetState.JUMP, PetState.FAILED],
-)
-def test_active_rows_keep_looping(state):
-    painted, _, settled = _play(state, 3, ticks=7)
-    assert settled is False
-    assert painted == [0, 1, 2, 0, 1, 2, 0]
+def test_an_unknown_state_falls_back_to_the_baseline_loop():
+    assert loop_ms_for("nao-existe") == LOOP_MS
+
+
+def test_the_enum_and_its_string_agree():
+    assert loop_ms_for(PetState.IDLE) == loop_ms_for("idle")
+
+
+def test_frame_interval_splits_the_loop_across_the_real_frames():
+    assert frame_interval_ms("idle", 6) == 800
+    assert frame_interval_ms("run", 6) == pytest.approx(183.33, abs=0.01)
+
+
+def test_a_ragged_row_is_clamped_instead_of_holding_one_frame_for_seconds():
+    # Um pet cujo idle só tenha 2 quadros reais daria 2200ms por quadro: isso não
+    # é respiração, é slideshow. O teto protege o pet dos outros.
+    assert frame_interval_ms("idle", 2) == MAX_FRAME_MS
+
+
+def test_frame_interval_survives_an_empty_row():
+    assert frame_interval_ms("idle", 0) > 0
+
+
+def test_the_cli_quantises_the_cadence_into_whole_ticks():
+    # O painel do CLI acorda a cada 160ms. Arredondar para tiques inteiros é o
+    # que mantém os estados rápidos exatamente como sempre foram (1 tique por
+    # quadro) em vez de dobrar a volta deles para 320ms.
+    assert ticks_for("run", 6, CLI_TICK_S) == 1
+    assert ticks_for("idle", 6, CLI_TICK_S) == 5
+    # `wave` pede 275ms, entre um tique e meio e dois. Arredondar a poria em 2
+    # tiques e a deixaria 16% mais lenta; o piso preserva o ritmo de sempre.
+    assert ticks_for("wave", 4, CLI_TICK_S) == 1
+
+
+def test_a_tick_count_is_never_zero():
+    assert ticks_for("run", 60, CLI_TICK_S) == 1

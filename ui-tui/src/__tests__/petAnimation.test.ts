@@ -5,27 +5,19 @@ import type { PetState } from '../app/usePet.js'
 
 const frames = (count: number, frameMs?: number) => ({ count, frameMs })
 
-// Walk the policy the way the hook does: paint, carry the cursor, stop when it
-// reports no next tick. Bounded so a looping state can never hang the test.
-const play = (state: PetState, count: number, ticks = 24) => {
+// Walk the policy the way the hook does: paint, carry the cursor.
+const play = (state: PetState, count: number, ticks: number) => {
   const painted: Array<number | null> = []
   let cursor = 0
-  let settled = false
 
   for (let i = 0; i < ticks; i += 1) {
     const step = nextAnimationStep(state, cursor, frames(count, 100))
 
     painted.push(step.index)
     cursor = step.cursor
-
-    if (step.delayMs === null) {
-      settled = true
-
-      break
-    }
   }
 
-  return { cursor, painted, settled }
+  return painted
 }
 
 describe('nextAnimationStep', () => {
@@ -37,39 +29,25 @@ describe('nextAnimationStep', () => {
     expect(nextAnimationStep('run', 0, frames(0))).toEqual({ cursor: 0, delayMs: FRAME_MS, index: null })
   })
 
-  it('plays idle through exactly one cycle and then rests on the first frame', () => {
-    expect(play('idle', 4)).toEqual({ cursor: 4, painted: [0, 1, 2, 3, 0], settled: true })
+  it.each<PetState>(['idle', 'run', 'review', 'waiting', 'wave', 'jump', 'failed'])('keeps %s looping', state => {
+    expect(play(state, 3, 7)).toEqual([0, 1, 2, 0, 1, 2, 0])
   })
 
-  it('rests idle on the first frame for any cursor past the cycle', () => {
-    expect(nextAnimationStep('idle', 4, frames(4))).toEqual({ cursor: 4, delayMs: null, index: 0 })
-    expect(nextAnimationStep('idle', 99, frames(4))).toEqual({ cursor: 4, delayMs: null, index: 0 })
-  })
-
-  it.each([1, 2, 5, 9])('settles idle after one cycle of %i frames', count => {
-    const { painted, settled } = play('idle', count)
-
-    expect(settled).toBe(true)
-    expect(painted.at(-1)).toBe(0)
-    expect(painted).toHaveLength(count + 1)
-  })
-
-  it.each<PetState>(['run', 'review', 'waiting', 'wave', 'jump', 'failed'])('keeps %s looping', state => {
-    const { painted, settled } = play(state, 3, 7)
-
-    expect(settled).toBe(false)
-    expect(painted).toEqual([0, 1, 2, 0, 1, 2, 0])
+  it.each([1, 2, 6, 8])('closes the loop whatever the frame count (%i)', count => {
+    expect(play('idle', count, count * 2)).toEqual([...Array(count).keys(), ...Array(count).keys()])
   })
 
   it('paces the tick with the frameMs the gateway sent', () => {
-    expect(nextAnimationStep('run', 0, frames(3, 83)).delayMs).toBe(83)
-    expect(nextAnimationStep('idle', 0, frames(3, 83)).delayMs).toBe(83)
+    // The gateway derives it per state, so `idle` arrives slow (it breathes)
+    // and the rows that report live work arrive fast. The hook just obeys.
+    expect(nextAnimationStep('idle', 0, frames(6, 733)).delayMs).toBe(733)
+    expect(nextAnimationStep('run', 0, frames(6, 183)).delayMs).toBe(183)
   })
 })
 
 describe('frameDelayMs', () => {
   it('uses a usable gateway cadence verbatim', () => {
-    expect(frameDelayMs(83.5)).toBe(83.5)
+    expect(frameDelayMs(733.33)).toBe(733.33)
   })
 
   it.each([undefined, 0, -5, Number.NaN, Number.POSITIVE_INFINITY])(

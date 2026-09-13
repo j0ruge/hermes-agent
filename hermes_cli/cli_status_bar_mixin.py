@@ -13,7 +13,7 @@ import threading
 import time
 
 from agent.pet import render as pet_render
-from agent.pet.state import next_frame_step
+from agent.pet.state import next_frame_step, ticks_for
 from hermes_cli.banner import _format_context_length
 from typing import Any, Dict, Optional
 
@@ -651,6 +651,7 @@ class CLIStatusBarMixin:
         self._pet_kitty_cache.clear()
         self._pet_kitty_pending = ""
         self._pet_kitty_image_id = 0
+        self._pet_tick_wait = 0
 
     def _pet_resolve_config(self) -> None:
         """(Re)resolve the active pet from config so ``/pet`` / ``hermes pets`` changes apply
@@ -700,7 +701,7 @@ class CLIStatusBarMixin:
                     self._pet_kitty_cache.clear()
                     self._pet_kitty_pending = ""
                     self._pet_kitty_image_id = pet_render.kitty_image_id(pet.slug)
-                    self._pet_frame_idx = self._pet_paint_idx = 0
+                    self._pet_frame_idx = self._pet_paint_idx = self._pet_tick_wait = 0
                     self._pet_anim_state = ""
                 self._pet_enabled = True
         except Exception:
@@ -889,11 +890,12 @@ class CLIStatusBarMixin:
     def _pet_anim_tick(self) -> bool:
         """Advance one animation frame. True when the pane needs repainting.
 
-        The policy is shared with the TUI (``agent.pet.state.next_frame_step``):
-        ``idle`` plays one cycle and settles on its first frame, every other row
-        keeps cycling. A settled pet returns False forever after, so a resting
-        mascot costs no repaints at all — that quiet is the whole point, since
-        ``idle`` is on screen precisely when nothing is happening.
+        The policy is shared with the TUI (``agent.pet.state``): every row loops,
+        and what separates them is the cadence. ``idle`` is the resting row — it
+        holds the screen precisely when nothing is happening — so it breathes at
+        roughly one loop every four seconds instead of the ~1s of the rows that
+        report live work. Returning False when the frame did not change keeps a
+        slow row from costing a repaint on every tick.
         """
         state = self._derive_pet_state()
         with self._pet_lock:
@@ -910,7 +912,16 @@ class CLIStatusBarMixin:
             changed = state != self._pet_anim_state
             if changed:
                 self._pet_anim_state = state
-                self._pet_frame_idx = 0
+                self._pet_frame_idx = self._pet_tick_wait = 0
+            elif count:
+                # A thread acorda a cada _PET_FRAME_INTERVAL para reagir rápido à
+                # troca de estado; o quadro só anda quando a cadência do estado
+                # vence, contada em tiques inteiros. `idle` respira a cada 5
+                # tiques; os estados rápidos seguem a 1, como sempre foram.
+                self._pet_tick_wait += 1
+                if self._pet_tick_wait < ticks_for(state, count, self._PET_FRAME_INTERVAL):
+                    return False
+                self._pet_tick_wait = 0
             step = next_frame_step(state, self._pet_frame_idx, count)
             self._pet_frame_idx = step.cursor
             if step.index is not None:
