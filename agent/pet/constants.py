@@ -15,8 +15,33 @@ from enum import Enum
 FRAME_W = 192
 FRAME_H = 208
 # Frames stepped per state (petdex CSS ``steps(6)``); extra physical columns are ignored.
-FRAMES_PER_STATE = 6
+FRAMES_PER_STATE = 8  # colunas por linha no contrato do Codex; linhas curtas
+# param no primeiro quadro em branco (ver `_raw_frames`), entao este teto so
+# limita o que o atlas realmente traz.
 LOOP_MS = 1100  # full-loop duration for one state, ms (petdex default)
+
+# `idle` is the resting row: it holds the corner of the screen precisely when
+# nothing is happening. At the baseline ~1s it reads as flicker; at a breathing
+# cadence (a resting mammal breathes ~14x a minute) it reads as alive. Every
+# other row is a live read-out of what the agent is doing and keeps the baseline.
+# 4800 é múltiplo exato do tique de 160ms do painel do CLI: assim as duas
+# superfícies tocam a respiração no mesmo ritmo, sem erro de quantização.
+IDLE_LOOP_MS = 4800
+STATE_LOOP_MS: dict[str, int] = {"idle": IDLE_LOOP_MS}
+
+# Ceiling for one frame. Rows are ragged (padding is trimmed), so a pet whose
+# `idle` ships only two real frames would otherwise hold each one for 2.2s —
+# a slideshow, not a breath.
+MAX_FRAME_MS = 1000
+
+
+def loop_ms_for(state: "PetState | str") -> int:
+    """Full-loop duration for *state*, falling back to the baseline.
+
+    Takes the enum or the raw string: the gateway forwards whatever the client
+    sent (``methods_session.py``), so this must never raise on an unknown row.
+    """
+    return STATE_LOOP_MS.get(str(getattr(state, "value", state)), LOOP_MS)
 
 # ``display.pet.scale`` is the single master scalar: the desktop canvas multiplies
 # native pixels by it and every terminal surface derives its column width from it

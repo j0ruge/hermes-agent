@@ -167,76 +167,79 @@ describe('usePet animation loop', () => {
     vi.restoreAllMocks()
   })
 
-  it('plays the idle row once and then rests on the first frame', async () => {
+  it('loops the idle row at the cadence the gateway sent', async () => {
     const pet = mountPet('cells')
 
     await advance(0)
     expect(pet.painted()).toEqual(['idle:0'])
 
-    await advance(FRAME_MS * 3)
-    expect(pet.painted()).toEqual(['idle:0', 'idle:1', 'idle:2', 'idle:0'])
+    await advance(FRAME_MS * 4)
+    expect(pet.painted()).toEqual(['idle:0', 'idle:1', 'idle:2', 'idle:0', 'idle:1'])
   })
 
-  it('never restarts idle, however long the agent sits still', async () => {
+  it('never stops, however long the agent sits still', async () => {
     const pet = mountPet('cells')
 
-    await advance(FRAME_MS * 100)
+    // The mount itself costs one advance: React only starts the animation
+    // effect on a real macrotask, after the gateway round-trip settles.
+    await advance(0)
+    await advance(FRAME_MS * 30)
 
-    expect(pet.painted()).toEqual(['idle:0', 'idle:1', 'idle:2', 'idle:0'])
+    expect(pet.painted().length).toBeGreaterThan(20)
   })
 
-  it('rests on the first frame in the kitty path too', async () => {
+  it('loops the kitty path too', async () => {
     const pet = mountPet('kitty')
 
-    await advance(FRAME_MS * 100)
+    await advance(0)
+    await advance(FRAME_MS * 5)
 
-    expect(pet.painted()).toEqual(['idle:0', 'idle:1', 'idle:2', 'idle:0'])
+    expect(pet.painted()).toEqual(['idle:0', 'idle:1', 'idle:2', 'idle:0', 'idle:1', 'idle:2'])
   })
 
-  it.each([1, 2, 6])('settles after one cycle whatever the frame count (%i)', async count => {
+  it.each([1, 2, 6])('closes the loop whatever the frame count (%i)', async count => {
     const pet = mountPet('kitty', count)
 
-    await advance(FRAME_MS * 100)
+    await advance(0)
+    await advance(FRAME_MS * count * 2)
 
-    expect(pet.painted()).toHaveLength(count + 1)
-    expect(pet.painted().at(-1)).toBe('idle:0')
+    expect(pet.painted().slice(0, count)).toEqual([...Array(count).keys()].map(i => `idle:${i}`))
   })
 
-  it('keeps looping while a tool is running', async () => {
+  it('switches to the running row and keeps looping there', async () => {
     const pet = mountPet('kitty')
 
-    await advance(FRAME_MS * 100)
+    await advance(FRAME_MS * 3)
     await enterRun()
     await advance(FRAME_MS * 6)
 
-    expect(pet.painted().slice(4)).toEqual(['run:0', 'run:1', 'run:2', 'run:0', 'run:1', 'run:2', 'run:0'])
+    expect(pet.painted().filter(label => label.startsWith('run'))).toEqual([
+      'run:0',
+      'run:1',
+      'run:2',
+      'run:0',
+      'run:1',
+      'run:2',
+      'run:0'
+    ])
   })
 
-  it('grants exactly one fresh cycle when the agent falls back to idle', async () => {
+  it('restarts the row from its first frame when the state changes back', async () => {
     const pet = mountPet('kitty')
 
-    await advance(FRAME_MS * 100)
+    await advance(FRAME_MS * 2)
     await enterRun()
     await advance(FRAME_MS * 2)
     await enterIdle()
-    await advance(FRAME_MS * 100)
+    await advance(0)
 
-    expect(pet.painted().filter(label => label.startsWith('idle'))).toEqual([
-      'idle:0',
-      'idle:1',
-      'idle:2',
-      'idle:0',
-      'idle:0',
-      'idle:1',
-      'idle:2',
-      'idle:0'
-    ])
+    expect(pet.painted().at(-1)).toBe('idle:0')
   })
 
   it('arms a single animation timer across a state change', async () => {
     const pet = mountPet('kitty')
 
-    await advance(FRAME_MS * 100)
+    await advance(FRAME_MS * 2)
     await enterRun()
     await advance(FRAME_MS)
 

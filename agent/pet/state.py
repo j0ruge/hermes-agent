@@ -9,7 +9,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from typing import Any, NamedTuple
 
-from agent.pet.constants import PetState
+from agent.pet.constants import MAX_FRAME_MS, PetState, loop_ms_for
 
 
 def todos_all_done(todos: Iterable[Any] | None) -> bool:
@@ -57,15 +57,6 @@ def derive_pet_state(
     return next((state for flag, state in ranked if flag), PetState.IDLE)
 
 
-# Rows that play once and then go quiet. ``idle`` is the resting pose: it holds
-# the corner of the screen precisely when nothing is happening, so looping it
-# turns into a permanent flicker in the user's periphery over a long session.
-# Every other row is a live read-out of what the agent is doing and keeps
-# cycling for as long as that state holds. Mirrored in the TUI's
-# ``ui-tui/src/app/petAnimation.ts``.
-ONE_SHOT_STATES: frozenset[str] = frozenset({PetState.IDLE})
-
-
 class PetFrameStep(NamedTuple):
     """What a render loop should do on this tick."""
 
@@ -75,26 +66,45 @@ class PetFrameStep(NamedTuple):
     cursor: int
     """Cursor to carry into the next call."""
 
-    animating: bool
-    """``False`` once the row has settled — stop advancing and stop repainting."""
-
 
 def next_frame_step(state: str, cursor: int, frame_count: int) -> PetFrameStep:
-    """Resolve one animation tick.
+    """Resolve one animation tick: which frame to paint, and the next cursor.
 
-    A one-shot row walks ``0..n-1``, paints the first frame once more and settles
-    there, so the pet rests on frame one rather than freezing on the last frame of
-    the cycle. Re-entering the state resets the cursor, which is what buys it a
-    fresh single cycle; holding the state costs nothing after it settles.
+    Every row loops. What separates the resting row from the busy ones is the
+    *cadence*, not the shape of the loop — see :func:`frame_interval_ms`. The
+    ``None`` index is the one branch that matters here: a state whose frames are
+    still loading must keep the painted frame up rather than blank the pet.
     """
     if frame_count < 1:
-        return PetFrameStep(None, cursor, True)
+        return PetFrameStep(None, cursor)
 
-    if state not in ONE_SHOT_STATES:
-        index = cursor % frame_count
-        return PetFrameStep(index, index + 1, True)
+    index = cursor % frame_count
 
-    if cursor < frame_count:
-        return PetFrameStep(cursor, cursor + 1, True)
+    return PetFrameStep(index, index + 1)
 
-    return PetFrameStep(0, frame_count, False)
+
+def frame_interval_ms(state: str, frame_count: int) -> float:
+    """How long one frame of *state* stays on screen.
+
+    The loop duration is fixed per state, so the frame count decides smoothness
+    rather than length — up to :data:`MAX_FRAME_MS`, which protects pets whose
+    rows ship fewer real frames than the taxonomy reserves.
+    """
+    return min(loop_ms_for(state) / max(1, frame_count), float(MAX_FRAME_MS))
+
+
+def ticks_for(state: str, frame_count: int, tick_seconds: float) -> int:
+    """Frame interval expressed in whole ticks of a *tick_seconds* render loop.
+
+    The CLI pane animates from a fixed 160ms thread, and rounding to whole ticks
+    is what keeps the fast rows exactly as they have always been (one frame per
+    tick) instead of quantising 183ms up to 320ms and halving their speed.
+    """
+    if tick_seconds <= 0:
+        return 1
+
+    # Piso, não arredondamento: arredondar faria uma linha cuja cadência fica
+    # entre um tique e meio e dois (a `wave`, 275ms) passar a segurar dois
+    # tiques e ficar 16% mais lenta sem ninguém ter pedido. Com piso, só quem
+    # tem cadência própria de verdade (o `idle`) muda de ritmo.
+    return max(1, int(frame_interval_ms(state, frame_count) / 1000.0 / tick_seconds))

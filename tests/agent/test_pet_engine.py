@@ -155,12 +155,14 @@ def test_trims_trailing_blank_frames(tmp_path):
     sheet.save(sprite)
 
     r = render.PetRenderer(str(sprite), mode="unicode", scale=0.5)
-    # Full rows cap at FRAMES_PER_STATE; ragged rows trim to their real count.
-    assert r.frame_count("idle") == constants.FRAMES_PER_STATE
-    assert r.frame_count("run") == constants.FRAMES_PER_STATE
+    # Cada linha toca os quadros que realmente tem, ate o contrato de 8 colunas:
+    # o corte e no primeiro quadro em branco, nao num teto fixo. Uma linha cheia
+    # de 8 (aqui `failed`) toca os 8 — antes perdia os dois ultimos.
+    assert r.frame_count("idle") == 6
+    assert r.frame_count("run") == 6
     assert r.frame_count("wave") == 4
     assert r.frame_count("jump") == 5
-    assert r.frame_count("failed") == constants.FRAMES_PER_STATE
+    assert r.frame_count("failed") == constants.FRAMES_PER_STATE == 8
     assert r.frame_count("review") == 5
 
     # Every stepped frame is non-empty — no blank flash for the trimmed states.
@@ -173,7 +175,7 @@ def test_trims_trailing_blank_frames(tmp_path):
         "idle": 6,
         "wave": 4,
         "run": 6,
-        "failed": 6,
+        "failed": 8,
         "review": 5,
         "jump": 5,
         "waiting": 0,

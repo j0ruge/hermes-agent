@@ -310,8 +310,8 @@ export function usePet(): PetRender {
 
   // Animation timer. Ticks chain through `setTimeout` rather than a fixed
   // interval so each state runs at the cadence the gateway sent with its
-  // frames, and so a one-shot state (idle) can stop scheduling once it has
-  // settled back on its first frame instead of looping forever.
+  // frames — `idle` breathes at roughly one loop every four seconds while the
+  // rows that report live work stay near one second.
   useEffect(() => {
     if (!enabled) {
       return
@@ -361,9 +361,7 @@ export function usePet(): PetRender {
         paint(entry, step.index)
       }
 
-      if (step.delayMs !== null) {
-        timer = setTimeout(tick, step.delayMs)
-      }
+      timer = setTimeout(tick, step.delayMs)
     }
 
     kick.current = () => {

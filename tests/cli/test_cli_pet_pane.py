@@ -14,6 +14,7 @@ import pytest
 from agent.pet import store
 from agent.pet.constants import FRAME_H, FRAME_W
 from agent.pet.render import PetRenderer
+from agent.pet.state import ticks_for
 from cli import HermesCLI
 
 
@@ -269,10 +270,11 @@ def test_force_full_redraw_requeues_kitty_frame(boba_like, monkeypatch):
 
 # ── animation loop ────────────────────────────────────────────────────────
 #
-# `idle` holds the pane while nothing happens, so looping it forever is a
-# permanent flicker in the corner of the screen. These drive one tick at a time
-# (the loop body without its `time.sleep`) and read back the frame that actually
-# reached the terminal.
+# Toda linha cicla; o que separa `idle` das outras é a cadência. A thread do
+# painel acorda a cada 160ms para reagir depressa à troca de estado, e cada
+# estado só troca de quadro quando a sua cadência vence — contada em tiques
+# inteiros, senão os 183ms dos estados rápidos arredondariam para 320ms e
+# dobrariam a volta deles. Estes testes dirigem tique a tique, sem relógio.
 
 
 def _kitty_cli(slug="boba"):
@@ -298,68 +300,80 @@ def _transmitted(cli_obj, state, ticks):
     return painted
 
 
-def test_idle_plays_one_cycle_then_rests_on_the_first_frame(boba_like):
-    cli_obj = _kitty_cli()
-    count = len(cli_obj._pet_kitty_payload_for("idle")["frames"])
-
-    assert _transmitted(cli_obj, "idle", count + 1) == list(range(count)) + [0]
-
-
-def test_idle_never_restarts_however_long_the_agent_sits_still(boba_like):
-    cli_obj = _kitty_cli()
-    count = len(cli_obj._pet_kitty_payload_for("idle")["frames"])
-
-    painted = _transmitted(cli_obj, "idle", count * 20)
-
-    assert painted == list(range(count)) + [0]
-
-
-def test_a_settled_pet_asks_for_no_repaints(boba_like):
-    cli_obj = _kitty_cli()
-    count = len(cli_obj._pet_kitty_payload_for("idle")["frames"])
-    for _ in range(count + 1):
-        cli_obj._pet_anim_tick()
-
-    assert [cli_obj._pet_anim_tick() for _ in range(5)] == [False] * 5
-
-
-def test_an_active_row_keeps_looping(boba_like):
+def test_a_live_readout_row_advances_on_every_tick(boba_like):
+    # A cadência de sempre: um quadro por tique de 160ms. Se isto quebrar, os
+    # estados que reportam trabalho ficaram mais lentos sem ninguém pedir.
     cli_obj = _kitty_cli()
     cli_obj._agent_running = True
     count = len(cli_obj._pet_kitty_payload_for("run")["frames"])
 
-    painted = _transmitted(cli_obj, "run", count * 2)
-
-    assert painted == list(range(count)) * 2
+    assert _transmitted(cli_obj, "run", count * 2) == list(range(count)) * 2
 
 
-def test_falling_back_to_idle_buys_exactly_one_fresh_cycle(boba_like):
+def test_idle_breathes_across_several_ticks_per_frame(boba_like):
     cli_obj = _kitty_cli()
     count = len(cli_obj._pet_kitty_payload_for("idle")["frames"])
-    _transmitted(cli_obj, "idle", count * 3)
+    passo = ticks_for("idle", count, cli_obj._PET_FRAME_INTERVAL)
+
+    assert passo > 1, "idle deveria segurar cada quadro por vários tiques"
+    # O primeiro tique pinta o quadro 0 (entrada no estado); daí em diante um
+    # quadro a cada `passo` tiques.
+    assert _transmitted(cli_obj, "idle", 1 + passo * 3) == [0, 1, 2, 3]
+
+
+def test_idle_keeps_looping_forever(boba_like):
+    cli_obj = _kitty_cli()
+    count = len(cli_obj._pet_kitty_payload_for("idle")["frames"])
+    passo = ticks_for("idle", count, cli_obj._PET_FRAME_INTERVAL)
+
+    painted = _transmitted(cli_obj, "idle", 1 + passo * count * 2)
+
+    assert painted == [0] + [(i + 1) % count for i in range(count * 2)]
+
+
+def test_a_state_change_repaints_on_the_next_tick(boba_like):
+    # Respirar devagar não pode atrasar a reação: o pet tem de mudar de linha no
+    # tique seguinte, não depois de esperar a cadência longa do idle vencer.
+    cli_obj = _kitty_cli()
+    cli_obj._pet_anim_tick()
+    cli_obj._pet_anim_tick()
 
     cli_obj._agent_running = True
-    _transmitted(cli_obj, "run", 3)
-    cli_obj._agent_running = False
 
-    assert _transmitted(cli_obj, "idle", count * 3) == list(range(count)) + [0]
+    assert cli_obj._pet_anim_tick() is True
+    assert cli_obj._pet_tick_wait == 0
 
 
-def test_half_block_path_also_rests_on_the_first_frame(boba_like):
+def test_rebuilding_the_pet_clears_the_cadence_counter(boba_like):
+    from hermes_cli.config import load_config, save_config
+
+    cli_obj = _kitty_cli()
+    cli_obj._pet_anim_tick()
+    cli_obj._pet_tick_wait = 3
+
+    cfg = load_config()
+    cfg.setdefault("display", {}).setdefault("pet", {}).update({"enabled": True, "slug": "boba"})
+    save_config(cfg)
+    cli_obj._pet_resolve_config()
+
+    assert cli_obj._pet_tick_wait == 0
+
+
+def test_half_block_path_animates_too(boba_like):
     cli_obj = _make_cli()
     cli_obj._pet_renderer = PetRenderer(
         str(store.load_pet("boba").spritesheet), mode="unicode", scale=0.4, unicode_cols=14
     )
     cli_obj._pet_cols = 14
     cli_obj._pet_enabled = True
+    cli_obj._agent_running = True
 
     def styles():
         return tuple(style for style, text in cli_obj._pet_fragments() if text != "\n")
 
     seen = []
-    for _ in range(40):
+    for _ in range(6):
         if cli_obj._pet_anim_tick():
             seen.append(styles())
 
-    assert len(seen) > 2, "expected the idle row to animate at least once"
-    assert seen[-1] == seen[0], "settled on a frame other than the first"
+    assert len(set(seen)) > 1, "o caminho de meio-blocos deveria trocar de quadro"
