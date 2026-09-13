@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import asdict, dataclass, field, fields
 from typing import Any, Mapping
 
@@ -69,6 +70,11 @@ _THRESHOLD_SOURCES: dict[str, tuple[str, str]] = {
 # Per-turn caps on runaway-prone tools (counters reset in reset_for_turn).
 _DEFAULT_MAX_WEB_SEARCHES_PER_TURN = 50
 _DEFAULT_MAX_SUBAGENTS_PER_TURN = 50
+# Cross-turn containment is deliberately narrow: validation retries from skill_manage
+# and fragile constructed terminal one-liners. Generic red terminal diagnostics stay
+# warning-tolerant so edit -> test and probe sweeps are not cut off.
+_DEFAULT_SESSION_FAILURE_HALT_AFTER = {"skill_manage": 3, "terminal": 3}
+_DEFAULT_SESSION_FAILURE_TTL_TURNS = 8
 
 # Interactive surfaces plus bounded supervised task loops (subagent stopped by its parent;
 # api_server has a live client) doing real edit -> re-run work keep the warn-only default.
@@ -105,8 +111,12 @@ class LoopCapConfig:
 
 @dataclass(frozen=True)
 class ToolCallGuardrailConfig:
-    """Thresholds for per-turn tool-call loop detection. Warnings never prevent execution; hard
-    stops are opt-in on interactive platforms, default on for unattended gateway/cron platforms."""
+    """Thresholds for tool-call loop detection.
+
+    Most counters are per-turn. ``session_failure_halt_after`` is a deliberately
+    narrow cross-turn circuit breaker for failure strategies that are known to be
+    recoverable by changing the payload/command, not by retrying it unchanged.
+    """
 
     warnings_enabled: bool = True
     hard_stop_enabled: bool = False
@@ -120,6 +130,10 @@ class ToolCallGuardrailConfig:
     idempotent_tools: frozenset[str] = field(default_factory=lambda: IDEMPOTENT_TOOL_NAMES)
     mutating_tools: frozenset[str] = field(default_factory=lambda: MUTATING_TOOL_NAMES)
     loop_caps: LoopCapConfig = field(default_factory=LoopCapConfig)
+    session_failure_halt_after: Mapping[str, int] = field(
+        default_factory=lambda: dict(_DEFAULT_SESSION_FAILURE_HALT_AFTER)
+    )
+    session_failure_ttl_turns: int = _DEFAULT_SESSION_FAILURE_TTL_TURNS
 
     @classmethod
     def from_mapping(
@@ -139,7 +153,29 @@ class ToolCallGuardrailConfig:
             return _int_at_least(nested, getattr(d, name), 1)
 
         thresholds = {name: threshold(name, *src) for name, src in _THRESHOLD_SOURCES.items()}
-        return cls(loop_caps=LoopCapConfig.from_mapping(data.get("loop_caps")), **flags, **thresholds)
+        raw_session = data.get("session_failure_halt_after")
+        session_failure_halt_after = dict(d.session_failure_halt_after)
+        if isinstance(raw_session, Mapping):
+            session_failure_halt_after.update({
+                str(tool): _int_at_least(value, session_failure_halt_after.get(str(tool), 3), 0)
+                for tool, value in raw_session.items()
+            })
+        return cls(
+            warnings_enabled=flags["warnings_enabled"],
+            hard_stop_enabled=flags["hard_stop_enabled"],
+            non_interactive_hard_stop_enabled=flags["non_interactive_hard_stop_enabled"],
+            exact_failure_warn_after=thresholds["exact_failure_warn_after"],
+            exact_failure_block_after=thresholds["exact_failure_block_after"],
+            same_tool_failure_warn_after=thresholds["same_tool_failure_warn_after"],
+            same_tool_failure_halt_after=thresholds["same_tool_failure_halt_after"],
+            no_progress_warn_after=thresholds["no_progress_warn_after"],
+            no_progress_block_after=thresholds["no_progress_block_after"],
+            loop_caps=LoopCapConfig.from_mapping(data.get("loop_caps")),
+            session_failure_halt_after=session_failure_halt_after,
+            session_failure_ttl_turns=_int_at_least(
+                data.get("session_failure_ttl_turns"), d.session_failure_ttl_turns, 1
+            ),
+        )
 
 
 @dataclass(frozen=True)
@@ -222,6 +258,66 @@ def classify_tool_failure(tool_name: str, result: str | None) -> tuple[bool, str
     return (True, " [error]") if '"error"' in lower or '"failed"' in lower or result.startswith("Error") else (False, "")
 
 
+def failure_strategy_class(
+    tool_name: str, args: Mapping[str, Any] | None, result: str | None,
+) -> str | None:
+    """Return a narrow cross-turn failure family, never raw tool output.
+
+    ``None`` means the failure remains a normal diagnostic result. Terminal is only
+    eligible when the command was assembled through ``*-c``; a generic exit code is
+    intentionally not enough to trip the cross-turn circuit breaker.
+    """
+    args = args if isinstance(args, Mapping) else {}
+    parsed = safe_json_loads(result or "")
+    parsed = parsed if isinstance(parsed, Mapping) else {}
+    text = " ".join(
+        str(parsed.get(key) or "") for key in ("error", "output")
+    ).lower() + " " + str(result or "").lower()
+
+    if tool_name == "skill_manage":
+        if "description" in text and ("char" in text or "limit" in text or "too long" in text):
+            return "description-too-long"
+        if "name" in text and ("required" in text or "missing" in text or "needs" in text):
+            return "missing-name"
+        if "file_path" in text or "must be under" in text or ("path" in text and "skill" in text):
+            return "path-validation"
+        return None
+
+    if tool_name != "terminal":
+        return None
+    command = str(args.get("command") or "").lower()
+    if not re.search(r"(?:^|\s)(?:python(?:3)?|bash|sh)\s+-c(?:\s|$)", command):
+        return None
+    return "constructed-command"
+
+
+def failure_strategy_fingerprint(
+    tool_name: str, strategy_class: str, args: Mapping[str, Any] | None, result: str | None,
+) -> str:
+    """Fingerprint the concrete cross-turn cause without retaining command/error text."""
+    args = args if isinstance(args, Mapping) else {}
+    if tool_name == "terminal":
+        parsed = safe_json_loads(result or "")
+        parsed = parsed if isinstance(parsed, Mapping) else {}
+        error = {
+            "error": _normalize_failure_text(parsed.get("error")),
+            "output": _normalize_failure_text(parsed.get("output")),
+            "exit_code": parsed.get("exit_code"),
+            "raw": "" if parsed else _normalize_failure_text(result),
+        }
+        cause = {"command": _normalize_failure_text(args.get("command")), "error": error}
+    else:
+        # Structured skill validation classes intentionally survive corrected argument
+        # attempts across turns; the class itself is the stable concrete cause.
+        cause = {"class": strategy_class}
+    return _sha256(_canonical_json(cause))
+
+
+def _normalize_failure_text(value: Any) -> str:
+    """Normalize representation-only whitespace while preserving substantive differences."""
+    return " ".join(str(value or "").split())
+
+
 # Guardrail verdict text injected into the conversation, keyed by decision code.
 # ``same_tool_failure_warning`` is built by _tool_failure_recovery_hint (tool-specific).
 _DECISION_MESSAGES: dict[str, str] = {
@@ -236,6 +332,14 @@ _DECISION_MESSAGES: dict[str, str] = {
     "same_tool_failure_halt": (
         "Stopped {tool_name}: it failed {count} times this turn. "
         "Stop retrying the same failing tool path and choose a different approach."
+    ),
+    "session_failure_halt": (
+        "Stopped {tool_name}: failure strategy `{failure_class}` recurred {count} times across turns. "
+        "Change the input or command construction before retrying."
+    ),
+    "session_failure_warning": (
+        "{tool_name}: failure strategy `{failure_class}` has recurred {count} times across turns. "
+        "Declare the cause and change the input or command construction before retrying."
     ),
     "repeated_exact_failure_warning": (
         "{tool_name} has failed {count} times with identical arguments. This looks like a loop; "
@@ -274,13 +378,24 @@ _LOOP_CAPS: dict[str, tuple[str, str, str]] = {
 
 
 class ToolCallGuardrailController:
-    """Per-turn controller for repeated failed/non-progressing tool calls."""
+    """Controller for repeated failed/non-progressing tool calls.
+
+    The normal detector is per-turn. A tiny session-scoped state is retained only
+    for the configured failure strategies that need a hard recovery boundary.
+    """
 
     def __init__(self, config: ToolCallGuardrailConfig | None = None):
         self.config = config or ToolCallGuardrailConfig()
+        self._session_failure_state: dict[tuple[str, str, str], tuple[int, int, str]] = {}
+        self._session_turn = 0
         self.reset_for_turn()
 
     def reset_for_turn(self) -> None:
+        self._session_turn += 1
+        cutoff = self._session_turn - self.config.session_failure_ttl_turns
+        self._session_failure_state = {
+            key: record for key, record in self._session_failure_state.items() if record[1] > cutoff
+        }
         self._exact_failure_counts: dict[ToolCallSignature, int] = {}
         self._same_tool_failure_counts: dict[str, int] = {}
         # signature -> a mutating call succeeded since its last failure
@@ -355,6 +470,33 @@ class ToolCallGuardrailController:
             exact_count = self._exact_failure_counts[signature] = self._exact_failure_counts.get(signature, 0) + 1
             same_count = self._same_tool_failure_counts[tool_name] = self._same_tool_failure_counts.get(tool_name, 0) + 1
             self._no_progress.pop(signature, None)
+            strategy_class = failure_strategy_class(tool_name, args, result)
+            session_limit = self.config.session_failure_halt_after.get(tool_name, 0)
+            if strategy_class is not None and session_limit:
+                fingerprint = failure_strategy_fingerprint(tool_name, strategy_class, args, result)
+                session_key = (tool_name, strategy_class, fingerprint)
+                previous = self._session_failure_state.get(session_key)
+                session_count = previous[0] + 1 if previous else 1
+                recovery_key = _normalize_failure_text(args.get("command")) if tool_name == "terminal" else strategy_class
+                self._session_failure_state[session_key] = (session_count, self._session_turn, recovery_key)
+                if session_count >= session_limit and self.config.hard_stop_enabled:
+                    return self._decide(
+                        "halt",
+                        "session_failure_halt",
+                        tool_name,
+                        session_count,
+                        signature,
+                        failure_class=strategy_class,
+                    )
+                if warnings and session_count >= max(session_limit - 1, 1):
+                    return self._decide(
+                        "warn",
+                        "session_failure_warning",
+                        tool_name,
+                        session_count,
+                        signature,
+                        failure_class=strategy_class,
+                    )
             # same_tool_failure counts DIFFERENT args on one tool; for failure-tolerant
             # tools a run of distinct red commands is diagnosis, not a loop — warn, never halt.
             if (
@@ -385,6 +527,21 @@ class ToolCallGuardrailController:
         if tool_name in PROGRESS_RESET_TOOL_NAMES or file_mutation_result_landed(tool_name, result):
             self._progress_since_failure.update(dict.fromkeys(self._exact_failure_counts, True))
             self._same_tool_failure_counts.clear()
+            recovery_keys: set[str] = set()
+            if tool_name == "terminal":
+                recovery_keys.add(_normalize_failure_text(args.get("command")))
+            elif tool_name == "skill_manage":
+                if args.get("description") is not None:
+                    recovery_keys.add("description-too-long")
+                if args.get("name") is not None:
+                    recovery_keys.add("missing-name")
+                if args.get("file_path") is not None:
+                    recovery_keys.add("path-validation")
+            if recovery_keys:
+                self._session_failure_state = {
+                    key: record for key, record in self._session_failure_state.items()
+                    if key[0] != tool_name or record[2] not in recovery_keys
+                }
         if not self._is_idempotent(tool_name):
             self._no_progress.pop(signature, None)
             return ToolGuardrailDecision(tool_name=tool_name, signature=signature)

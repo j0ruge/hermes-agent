@@ -512,6 +512,11 @@ DEFAULT_CONFIG = {
         "hard_stop_after": {
             "exact_failure": 5, "same_tool_failure": 8, "idempotent_no_progress": 5
         },
+        # Narrow cross-turn circuit breakers. Generic terminal diagnostics stay
+        # tolerant; terminal is eligible only for constructed *-c commands.
+        "session_failure_halt_after": {"skill_manage": 3, "terminal": 3},
+        # Forget an inactive failure cause after this many turn boundaries.
+        "session_failure_ttl_turns": 8,
         # Per-turn hard ceilings for runaway-prone tools; counters reset every turn, always on
         # regardless of the thresholds above. Dozens of searches/subagents in ONE turn is already
         # pathological, hence low defaults. 0 = unlimited.

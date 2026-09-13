@@ -405,6 +405,107 @@ def test_default_run_conversation_warns_without_guardrail_halt():
     assert any("repeated_exact_failure_warning" in content for content in tool_contents)
 
 
+def test_cross_turn_failure_halt_reaches_runtime_observation_path():
+    agent = _make_agent(
+        "skill_manage",
+        config={
+            "tool_loop_guardrails": {
+                "hard_stop_enabled": True,
+                "session_failure_halt_after": {"skill_manage": 3},
+            }
+        },
+    )
+    result = '{"error": "description has 138 chars; limit is 60"}'
+    guardrails = getattr(agent, "_tool_guardrails")
+
+    for i in range(2):
+        setattr(agent, "_tool_guardrail_halt_decision", None)
+        content = agent._append_guardrail_observation(
+            "skill_manage",
+            {"name": f"example-{i}", "description": "too long"},
+            result,
+            failed=True,
+        )
+        assert "session_failure_halt" not in content
+        if i == 1:
+            assert "session_failure_warning" in content
+        guardrails.reset_for_turn()
+
+    setattr(agent, "_tool_guardrail_halt_decision", None)
+    content = agent._append_guardrail_observation(
+        "skill_manage",
+        {"name": "example-2", "description": "still too long"},
+        result,
+        failed=True,
+    )
+    assert "session_failure_halt" in content
+    halt_decision = getattr(agent, "_tool_guardrail_halt_decision")
+    assert halt_decision is not None
+    assert halt_decision.code == "session_failure_halt"
+
+
+@pytest.mark.parametrize(
+    ("platform", "expects_halt"),
+    [("telegram", True), ("cli", False)],
+)
+def test_real_consecutive_conversations_preserve_cross_turn_policy(platform, expects_halt):
+    agent = _make_agent(
+        "skill_manage",
+        max_iterations=5,
+        platform=platform,
+        config={
+            "tool_loop_guardrails": {
+                "session_failure_halt_after": {"skill_manage": 3},
+            }
+        },
+    )
+    responses = []
+    for i in range(3):
+        responses.extend([
+            _mock_response(
+                content="",
+                finish_reason="tool_calls",
+                tool_calls=[_mock_tool_call(
+                    "skill_manage",
+                    json.dumps({"name": f"example-{i}", "description": "too long"}),
+                    f"cross-turn-{i}",
+                )],
+            ),
+            _mock_response(content=f"turn {i} done"),
+        ])
+    responses.insert(2, _mock_response(
+        content="",
+        finish_reason="tool_calls",
+        tool_calls=[_mock_tool_call(
+            "skill_manage", json.dumps({"name": "unrelated"}), "cross-turn-unrelated"
+        )],
+    ))
+    agent.client.chat.completions.create.side_effect = responses
+    failure = '{"error":"description has 138 chars; limit is 60"}'
+
+    def skill_result(_name, args, _task_id=None, **_kwargs):
+        return failure if args.get("description") else '{"error":"remote registry unavailable"}'
+
+    results = []
+    with (
+        patch("model_tools.handle_function_call", side_effect=skill_result) as mock_hfc,
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        for i in range(3):
+            results.append(agent.run_conversation(f"fix skill attempt {i}"))
+
+    assert mock_hfc.call_count == 4
+    if expects_halt:
+        assert results[-1]["guardrail"]["code"] == "session_failure_halt"
+        assert results[-1]["turn_exit_reason"] == "guardrail_halt"
+        assert "stopped retrying skill_manage" in results[-1]["final_response"]
+    else:
+        assert all("guardrail" not in result for result in results)
+        assert results[-1]["final_response"] == "turn 2 done"
+
+
 
 
 def test_guardrail_halt_emits_final_response_through_stream_delta_callback():

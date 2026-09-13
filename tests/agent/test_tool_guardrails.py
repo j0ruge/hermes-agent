@@ -8,6 +8,7 @@ from agent.tool_guardrails import (
     ToolCallSignature,
     canonical_tool_args,
     classify_tool_failure,
+    failure_strategy_class,
 )
 
 
@@ -45,6 +46,8 @@ def test_default_config_is_soft_warning_only_with_hard_stop_disabled():
     assert cfg.exact_failure_block_after == 5
     assert cfg.same_tool_failure_halt_after == 8
     assert cfg.no_progress_block_after == 5
+    assert cfg.session_failure_halt_after == {"skill_manage": 3, "terminal": 3}
+    assert cfg.session_failure_ttl_turns == 8
 
 
 def test_config_parses_nested_warn_and_hard_stop_thresholds():
@@ -73,6 +76,24 @@ def test_config_parses_nested_warn_and_hard_stop_thresholds():
     assert cfg.exact_failure_block_after == 6
     assert cfg.same_tool_failure_halt_after == 7
     assert cfg.no_progress_block_after == 8
+
+
+def test_config_parses_narrow_cross_turn_failure_limits():
+    cfg = ToolCallGuardrailConfig.from_mapping(
+        {
+            "session_failure_halt_after": {"skill_manage": 4, "terminal": 2},
+        }
+    )
+
+    assert cfg.session_failure_halt_after == {"skill_manage": 4, "terminal": 2}
+
+
+def test_partial_cross_turn_config_merges_defaults_and_zero_disables_one_tool():
+    cfg = ToolCallGuardrailConfig.from_mapping(
+        {"session_failure_halt_after": {"terminal": 0}}
+    )
+
+    assert cfg.session_failure_halt_after == {"skill_manage": 3, "terminal": 0}
 
 
 def test_gateway_platform_defaults_to_hard_stop_without_changing_interactive_defaults():
@@ -357,6 +378,108 @@ def test_distinct_failing_terminal_commands_warn_but_never_halt():
     for i in range(8):
         last = c2.after_call("send_message", {"to": f"u{i}"}, '{"error": "no route"}', failed=True)
     assert last.should_halt and last.code == "same_tool_failure_halt"
+
+
+def test_skill_manage_validation_failures_halt_across_turn_boundaries():
+    c = ToolCallGuardrailController(ToolCallGuardrailConfig(hard_stop_enabled=True))
+    result = '{"error": "description has 138 chars; limit is 60"}'
+    for i in range(2):
+        decision = c.after_call(
+            "skill_manage",
+            {"name": "example", "description": "too long"},
+            result,
+            failed=True,
+        )
+        assert not decision.should_halt
+        if i == 1:
+            assert decision.action == "warn"
+            assert decision.code == "session_failure_warning"
+        c.reset_for_turn()
+
+    decision = c.after_call(
+        "skill_manage",
+        {"name": "example-3", "description": "still too long"},
+        result,
+        failed=True,
+    )
+    assert decision.should_halt
+    assert decision.code == "session_failure_halt"
+    assert decision.count == 3
+    assert "description-too-long" in decision.message
+
+
+def test_unknown_skill_manage_failure_requires_manual_review():
+    assert failure_strategy_class(
+        "skill_manage", {"name": "example"}, '{"error": "remote registry unavailable"}'
+    ) is None
+
+
+def test_constructed_terminal_failures_halt_across_turns_but_generic_diagnostics_do_not():
+    c = ToolCallGuardrailController(ToolCallGuardrailConfig(hard_stop_enabled=True))
+    for i in range(2):
+        decision = c.after_call(
+            "terminal",
+            {"command": "python3   -c 'print(1)'"},
+            '{"output": "Traceback", "exit_code": 1}',
+            failed=True,
+        )
+        assert not decision.should_halt
+        if i == 1:
+            assert decision.action == "warn"
+            assert decision.code == "session_failure_warning"
+        c.reset_for_turn()
+
+    decision = c.after_call(
+        "terminal",
+        {"command": "python3 -c 'print(1)'"},
+        '{"output": "Traceback", "exit_code": 1}',
+        failed=True,
+    )
+    assert decision.should_halt
+    assert decision.code == "session_failure_halt"
+    assert decision.count == 3
+
+    changed = ToolCallGuardrailController(ToolCallGuardrailConfig(hard_stop_enabled=True))
+    attempts = (
+        ({"command": "python3 -c 'print(1)'"}, '{"output":"first cause","exit_code":1}'),
+        ({"command": "python3 -c 'print(2)'"}, '{"output":"first cause","exit_code":1}'),
+        ({"command": "python3 -c 'print(1)'"}, '{"output":"second cause","exit_code":1}'),
+    )
+    for args, result in attempts:
+        assert not changed.after_call("terminal", args, result, failed=True).should_halt
+        changed.reset_for_turn()
+
+
+def test_cross_turn_state_expires_and_success_clears_only_matching_terminal_cause():
+    cfg = ToolCallGuardrailConfig(
+        hard_stop_enabled=True, session_failure_halt_after={"terminal": 2}, session_failure_ttl_turns=2
+    )
+    c = ToolCallGuardrailController(cfg)
+    command_a = {"command": "python -c 'raise ValueError()'"}
+    command_b = {"command": "python -c 'raise RuntimeError()'"}
+    error = '{"output":"Traceback","exit_code":1}'
+    c.after_call("terminal", command_a, error, failed=True)
+    c.after_call("terminal", command_b, error, failed=True)
+    c.after_call("terminal", command_a, '{"output":"ok","exit_code":0}', failed=False)
+    c.reset_for_turn()
+    assert not c.after_call("terminal", command_a, error, failed=True).should_halt
+    assert c.after_call("terminal", command_b, error, failed=True).should_halt
+
+    expiring = ToolCallGuardrailController(cfg)
+    expiring.after_call("terminal", command_a, error, failed=True)
+    expiring.reset_for_turn()
+    expiring.reset_for_turn()
+    assert not expiring.after_call("terminal", command_a, error, failed=True).should_halt
+
+    generic = ToolCallGuardrailController(ToolCallGuardrailConfig(hard_stop_enabled=True))
+    for i in range(12):
+        decision = generic.after_call(
+            "terminal",
+            {"command": f"grep -q needle{i} haystack.txt"},
+            '{"output": "not found", "exit_code": 1}',
+            failed=True,
+        )
+        assert not decision.should_halt
 
 
 def test_browser_retry_after_action_is_not_a_replay():
