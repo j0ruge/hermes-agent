@@ -6,6 +6,7 @@ import { createPetSingleFlight, requestPetUpdate } from '../lib/petPolling.js'
 
 import { useGateway } from './gatewayContext.js'
 import { $overlayState, getOverlayState } from './overlayStore.js'
+import { FRAME_MS, nextAnimationStep } from './petAnimation.js'
 import { $petFlash } from './petFlashStore.js'
 import { $turnState } from './turnStore.js'
 import { $uiState } from './uiStore.js'
@@ -79,7 +80,6 @@ type CacheEntry =
   | { kind: 'cells'; frameMs: number; frames: PetGrid[] }
   | { kind: 'kitty'; frameMs: number; frames: string[]; placeholder: string[]; color: string }
 
-const FRAME_MS = 160
 const POLL_MS = 2500
 
 // Only the standalone TUI owns a real terminal it can splat image escapes into;
@@ -122,6 +122,10 @@ export function usePet(): PetRender {
   const imageIdRef = useRef(0)
   const stateRef = useRef<PetState>('idle')
   const frameRef = useRef(0)
+  // Set by the animation effect; lets `sync` restart a settled animation as
+  // soon as frames land, since a settled state has no pending tick to pick
+  // them up (a fresh selection, or a pet adopted while the agent sat idle).
+  const kick = useRef<() => void>(() => {})
   const runSingleFlight = useRef(createPetSingleFlight()).current
 
   const [petState, setPetState] = useState<PetState>('idle')
@@ -285,6 +289,7 @@ export function usePet(): PetRender {
         }
 
         setEnabled(true)
+        kick.current()
       }),
     [disablePet, gw, releaseKitty, runSingleFlight]
   )
@@ -303,27 +308,24 @@ export function usePet(): PetRender {
 
   useEffect(() => releaseKitty, [releaseKitty])
 
-  // Animation timer.
+  // Animation timer. Ticks chain through `setTimeout` rather than a fixed
+  // interval so each state runs at the cadence the gateway sent with its
+  // frames, and so a one-shot state (idle) can stop scheduling once it has
+  // settled back on its first frame instead of looping forever.
   useEffect(() => {
     if (!enabled) {
       return
     }
 
-    const tick = () => {
-      const entry = cache.current.get(`${slugRef.current}:${stateRef.current}`)
+    let timer: ReturnType<typeof setTimeout> | undefined
+    let live = true
 
-      if (!entry?.frames.length) {
-        return // keep the last frame painted while the new state loads
-      }
-
-      const idx = frameRef.current % entry.frames.length
-      frameRef.current = idx + 1
-
+    const paint = (entry: CacheEntry, index: number) => {
       if (entry.kind === 'kitty') {
         // Transmit this frame's image under the shared id; the static
         // placeholder cells (set below) render it. No Ink repaint needed.
         try {
-          write(entry.frames[idx] ?? '')
+          write(entry.frames[index] ?? '')
         } catch {
           // ignore transmit failures
         }
@@ -339,13 +341,44 @@ export function usePet(): PetRender {
       }
 
       setKitty(null)
-      setGrid(entry.frames[idx] ?? null)
+      setGrid(entry.frames[index] ?? null)
+    }
+
+    const tick = () => {
+      if (!live) {
+        return
+      }
+
+      const entry = cache.current.get(`${slugRef.current}:${stateRef.current}`)
+      const frames = entry?.frames.length ? { count: entry.frames.length, frameMs: entry.frameMs } : null
+      const step = nextAnimationStep(stateRef.current, frameRef.current, frames)
+
+      frameRef.current = step.cursor
+
+      // A null index is "frames still loading" — keep the painted frame up
+      // rather than blanking the pet while the fetch is in flight.
+      if (entry && step.index !== null) {
+        paint(entry, step.index)
+      }
+
+      if (step.delayMs !== null) {
+        timer = setTimeout(tick, step.delayMs)
+      }
+    }
+
+    kick.current = () => {
+      clearTimeout(timer)
+      tick()
     }
 
     tick()
-    const interval = setInterval(tick, FRAME_MS)
 
-    return () => clearInterval(interval)
+    return () => {
+      live = false
+
+      kick.current = () => {}
+      clearTimeout(timer)
+    }
   }, [enabled, petState, write])
 
   return { enabled, grid, kitty }
