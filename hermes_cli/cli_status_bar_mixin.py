@@ -13,7 +13,7 @@ import threading
 import time
 
 from agent.pet import render as pet_render
-from agent.pet.state import next_frame_step, ticks_for
+from agent.pet.state import frame_ms_sequence, next_frame_step, ticks_for
 from hermes_cli.banner import _format_context_length
 from typing import Any, Dict, Optional
 
@@ -652,6 +652,7 @@ class CLIStatusBarMixin:
         self._pet_kitty_pending = ""
         self._pet_kitty_image_id = 0
         self._pet_tick_wait = 0
+        self._pet_frame_weights = {}
 
     def _pet_resolve_config(self) -> None:
         """(Re)resolve the active pet from config so ``/pet`` / ``hermes pets`` changes apply
@@ -679,6 +680,7 @@ class CLIStatusBarMixin:
             pet = None
             if enabled and configured_mode != "off":
                 pet = store.resolve_active_pet(slug)
+            self._pet_frame_weights = pet.frame_weights if pet is not None else {}
             if pet is None or not pet.exists:
                 with self._pet_lock:
                     self._pet_clear_runtime()
@@ -919,7 +921,8 @@ class CLIStatusBarMixin:
                 # vence, contada em tiques inteiros. `idle` respira a cada 5
                 # tiques; os estados rápidos seguem a 1, como sempre foram.
                 self._pet_tick_wait += 1
-                if self._pet_tick_wait < ticks_for(state, count, self._PET_FRAME_INTERVAL):
+                held = frame_ms_sequence(state, count, self._pet_frame_weights.get(state))[self._pet_paint_idx % count]
+                if self._pet_tick_wait < ticks_for(state, count, self._PET_FRAME_INTERVAL, frame_ms=held):
                     return False
                 self._pet_tick_wait = 0
             step = next_frame_step(state, self._pet_frame_idx, count)

@@ -16,7 +16,7 @@ import logging
 import re
 import shutil
 import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -45,6 +45,10 @@ class InstalledPet:
     directory: Path
     spritesheet: Path
     created_by: str = ""  # "generator" for pets hatched locally; "" for petdex installs
+    frame_weights: dict = field(default_factory=dict)
+    """Optional ``frameWeightsByState`` from ``pet.json``: relative dwell per frame
+    of a row, so the art can say a blink is quick without owning the loop's
+    duration. Absent for every pet that does not care — which is most of them."""
 
     @property
     def exists(self) -> bool:
@@ -102,7 +106,9 @@ def load_pet(slug: str) -> InstalledPet | None:
         return None
     meta = _read_pet_json(directory)
     name, desc, by = (str(meta.get(k, "") or d) for k, d in (("displayName", slug), ("description", ""), ("createdBy", "")))
-    return InstalledPet(slug, name, desc, directory, _resolve_spritesheet(directory, meta), by)
+    weights = meta.get("frameWeightsByState")
+    return InstalledPet(slug, name, desc, directory, _resolve_spritesheet(directory, meta), by,
+                        weights if isinstance(weights, dict) else {})
 
 
 def _usable_pet(slug: str, error: str = "") -> InstalledPet | None:

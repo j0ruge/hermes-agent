@@ -14,7 +14,7 @@ import pytest
 from agent.pet import store
 from agent.pet.constants import FRAME_H, FRAME_W
 from agent.pet.render import PetRenderer
-from agent.pet.state import ticks_for
+from agent.pet.state import frame_ms_sequence, ticks_for
 from cli import HermesCLI
 
 
@@ -60,6 +60,7 @@ def _make_cli():
     cli_obj._pet_frame_idx = 0
     cli_obj._pet_paint_idx = 0
     cli_obj._pet_anim_state = ""
+    cli_obj._pet_frame_weights = {}
     cli_obj._agent_running = False
     # Transient-beat + reasoning state (set by HermesCLI.__init__ in production).
     cli_obj._pet_event = ""
@@ -377,3 +378,23 @@ def test_half_block_path_animates_too(boba_like):
             seen.append(styles())
 
     assert len(set(seen)) > 1, "o caminho de meio-blocos deveria trocar de quadro"
+
+
+def test_a_frame_the_pet_declares_as_quick_holds_a_single_tick(boba_like):
+    """Uma piscada é um evento de ~150ms; segurá-la um beat inteiro de
+    respiração leria como sono. O peso na `pet.json` diz que aquele quadro é
+    rápido, e a volta continua durando o que `STATE_LOOP_MS` manda."""
+    cli_obj = _kitty_cli()
+    count = len(cli_obj._pet_kitty_payload_for("idle")["frames"])
+    rapido = count - 2
+    pesos = [1.0] * count
+    pesos[rapido] = 0.2
+    cli_obj._pet_frame_weights = {"idle": pesos}
+
+    longo = ticks_for("idle", count, cli_obj._PET_FRAME_INTERVAL,
+                      frame_ms=frame_ms_sequence("idle", count, pesos)[0])
+    painted = _transmitted(cli_obj, "idle", 1 + longo * rapido + 1 + longo)
+
+    # Chega ao quadro rápido gastando `longo` tiques por quadro, e sai dele no
+    # tique seguinte — o que o ritmo uniforme não permitiria.
+    assert painted[: rapido + 2] == list(range(rapido + 2))

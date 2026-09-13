@@ -66,6 +66,7 @@ interface PetCellsResult {
   color?: string
   enabled?: boolean
   frameMs?: number
+  frameMsList?: number[]
   // unicode mode: cell grids; kitty mode: transmit-escape strings.
   frames?: PetGrid[] | string[]
   graphics?: string
@@ -77,8 +78,8 @@ interface PetCellsResult {
 }
 
 type CacheEntry =
-  | { kind: 'cells'; frameMs: number; frames: PetGrid[] }
-  | { kind: 'kitty'; frameMs: number; frames: string[]; placeholder: string[]; color: string }
+  | { kind: 'cells'; frameMs: number; frameMsList?: number[]; frames: PetGrid[] }
+  | { kind: 'kitty'; frameMs: number; frameMsList?: number[]; frames: string[]; placeholder: string[]; color: string }
 
 const POLL_MS = 2500
 
@@ -276,6 +277,7 @@ export function usePet(): PetRender {
           cache.current.set(`${slug}:${state}`, {
             color: res.color ?? '#000001',
             frameMs: res.frameMs ?? FRAME_MS,
+            frameMsList: res.frameMsList,
             frames: res.frames as string[],
             kind: 'kitty',
             placeholder: res.placeholder
@@ -283,6 +285,7 @@ export function usePet(): PetRender {
         } else if (res.frames?.length) {
           cache.current.set(`${slug}:${state}`, {
             frameMs: res.frameMs ?? FRAME_MS,
+            frameMsList: res.frameMsList,
             frames: res.frames as PetGrid[],
             kind: 'cells'
           })
@@ -350,7 +353,11 @@ export function usePet(): PetRender {
       }
 
       const entry = cache.current.get(`${slugRef.current}:${stateRef.current}`)
-      const frames = entry?.frames.length ? { count: entry.frames.length, frameMs: entry.frameMs } : null
+
+      const frames = entry?.frames.length
+        ? { count: entry.frames.length, frameMs: entry.frameMs, frameMsByIndex: entry.frameMsList }
+        : null
+
       const step = nextAnimationStep(stateRef.current, frameRef.current, frames)
 
       frameRef.current = step.cursor

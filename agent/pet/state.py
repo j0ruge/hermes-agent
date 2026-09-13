@@ -9,7 +9,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from typing import Any, NamedTuple
 
-from agent.pet.constants import MAX_FRAME_MS, PetState, loop_ms_for
+from agent.pet.constants import MAX_FRAME_MS, MIN_FRAME_MS, PetState, loop_ms_for
 
 
 def todos_all_done(todos: Iterable[Any] | None) -> bool:
@@ -93,7 +93,36 @@ def frame_interval_ms(state: str, frame_count: int) -> float:
     return min(loop_ms_for(state) / max(1, frame_count), float(MAX_FRAME_MS))
 
 
-def ticks_for(state: str, frame_count: int, tick_seconds: float) -> int:
+def frame_ms_sequence(state: str, frame_count: int, weights: list | None = None) -> list[float]:
+    """How long each frame of *state* stays on screen, across one loop.
+
+    Uniform unless the pet's manifest declares weights for the row. A blink is
+    an event of about 150ms: held for a full beat of a breathing row it reads as
+    sleep, not as life. Weights say *which frames are quick* while the loop
+    duration stays owned by :data:`STATE_LOOP_MS` — so the art never has to
+    restate a cadence it does not own, and a pet stays correct if that cadence
+    ever changes.
+
+    Anything malformed (wrong length, non-numbers, all zeros) falls back to
+    uniform: a cosmetic manifest must never be able to freeze the pet.
+    """
+    count = max(0, frame_count)
+    uniform = [frame_interval_ms(state, frame_count)] * count
+
+    if not isinstance(weights, (list, tuple)) or len(weights) != count or not count:
+        return uniform
+
+    values = [float(w) for w in weights if isinstance(w, (int, float)) and not isinstance(w, bool) and w > 0]
+    if len(values) != count:
+        return uniform
+
+    loop_ms = frame_interval_ms(state, frame_count) * count
+    total = sum(values)
+
+    return [min(max(loop_ms * w / total, float(MIN_FRAME_MS)), float(MAX_FRAME_MS)) for w in values]
+
+
+def ticks_for(state: str, frame_count: int, tick_seconds: float, *, frame_ms: float | None = None) -> int:
     """Frame interval expressed in whole ticks of a *tick_seconds* render loop.
 
     The CLI pane animates from a fixed 160ms thread, and rounding to whole ticks
@@ -107,4 +136,6 @@ def ticks_for(state: str, frame_count: int, tick_seconds: float) -> int:
     # entre um tique e meio e dois (a `wave`, 275ms) passar a segurar dois
     # tiques e ficar 16% mais lenta sem ninguém ter pedido. Com piso, só quem
     # tem cadência própria de verdade (o `idle`) muda de ritmo.
-    return max(1, int(frame_interval_ms(state, frame_count) / 1000.0 / tick_seconds))
+    interval = frame_interval_ms(state, frame_count) if frame_ms is None else frame_ms
+
+    return max(1, int(interval / 1000.0 / tick_seconds))

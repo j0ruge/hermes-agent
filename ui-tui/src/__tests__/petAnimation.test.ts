@@ -37,6 +37,19 @@ describe('nextAnimationStep', () => {
     expect(play('idle', count, count * 2)).toEqual([...Array(count).keys(), ...Array(count).keys()])
   })
 
+  it('gives a frame the pet declared quick its own shorter delay', () => {
+    // A blink is an event of ~150ms. On a breathing row every other frame is a
+    // beat of the breath, and holding the blink that long reads as sleep.
+    const breathing = { count: 6, frameMs: 800, frameMsByIndex: [923, 923, 923, 923, 185, 923] }
+
+    expect(nextAnimationStep('idle', 4, breathing).delayMs).toBe(185)
+    expect(nextAnimationStep('idle', 0, breathing).delayMs).toBe(923)
+  })
+
+  it('falls back to the row cadence for a frame the list does not cover', () => {
+    expect(nextAnimationStep('idle', 5, { count: 6, frameMs: 800, frameMsByIndex: [185] }).delayMs).toBe(800)
+  })
+
   it('paces the tick with the frameMs the gateway sent', () => {
     // The gateway derives it per state, so `idle` arrives slow (it breathes)
     // and the rows that report live work arrive fast. The hook just obeys.

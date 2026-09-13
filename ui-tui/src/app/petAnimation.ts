@@ -6,6 +6,8 @@ export const FRAME_MS = 160
 export interface PetFrameSet {
   count: number
   frameMs?: number
+  /** Per-frame dwell, when the pet declares some frames are quick (a blink). */
+  frameMsByIndex?: number[]
 }
 
 export interface PetAnimationStep {
@@ -29,9 +31,10 @@ export function frameDelayMs(frameMs?: number): number {
  *
  * Every row loops; what separates them is the cadence the gateway sends with
  * the frames (`idle` breathes at roughly one loop every four seconds, the rows
- * that report live work stay near one second). The null index is the branch
- * that matters here: a state whose frames are still loading must keep the
- * painted frame up rather than blank the pet.
+ * that report live work stay near one second), and a row may declare that some
+ * of its frames are quick — a blink is an event, not a beat of the breath. The
+ * null index is the branch that matters here: a state whose frames are still
+ * loading must keep the painted frame up rather than blank the pet.
  */
 export function nextAnimationStep(state: PetState, cursor: number, frames: PetFrameSet | null): PetAnimationStep {
   const count = frames?.count ?? 0
@@ -43,5 +46,5 @@ export function nextAnimationStep(state: PetState, cursor: number, frames: PetFr
 
   const index = cursor % count
 
-  return { cursor: index + 1, delayMs: frameDelayMs(frames?.frameMs), index }
+  return { cursor: index + 1, delayMs: frameDelayMs(frames?.frameMsByIndex?.[index] ?? frames?.frameMs), index }
 }

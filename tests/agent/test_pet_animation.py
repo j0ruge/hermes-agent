@@ -9,8 +9,8 @@ from __future__ import annotations
 
 import pytest
 
-from agent.pet.constants import LOOP_MS, MAX_FRAME_MS, PetState, loop_ms_for
-from agent.pet.state import frame_interval_ms, next_frame_step, ticks_for
+from agent.pet.constants import LOOP_MS, MAX_FRAME_MS, MIN_FRAME_MS, PetState, loop_ms_for
+from agent.pet.state import frame_interval_ms, frame_ms_sequence, next_frame_step, ticks_for
 
 CLI_TICK_S = 0.16
 
@@ -83,3 +83,45 @@ def test_the_cli_quantises_the_cadence_into_whole_ticks():
 
 def test_a_tick_count_is_never_zero():
     assert ticks_for("run", 60, CLI_TICK_S) == 1
+
+
+# ── duração por quadro ────────────────────────────────────────────────────
+#
+# Uma piscada é um evento de ~150ms. Segurá-la por um quadro inteiro de
+# respiração (800ms) lê como sono, não como vida. Os pesos deixam a arte dizer
+# quais quadros são rápidos sem tirar de `STATE_LOOP_MS` a posse da duração da
+# volta: cada quadro recebe uma fatia proporcional ao seu peso.
+
+
+def test_a_row_without_weights_is_uniform():
+    assert frame_ms_sequence("idle", 6) == [800.0] * 6
+
+
+def test_weights_shorten_one_frame_and_keep_the_loop_length():
+    seq = frame_ms_sequence("idle", 6, [1, 1, 1, 1, 0.2, 1])
+
+    assert sum(seq) == pytest.approx(loop_ms_for("idle"))
+    assert seq[4] < 250
+    assert all(q > 700 for i, q in enumerate(seq) if i != 4)
+
+
+def test_weights_of_the_wrong_length_are_ignored():
+    assert frame_ms_sequence("idle", 6, [1, 1]) == [800.0] * 6
+
+
+def test_a_frame_is_never_shorter_than_the_eye_can_see():
+    seq = frame_ms_sequence("idle", 6, [1, 1, 1, 1, 0.001, 1])
+
+    assert seq[4] >= MIN_FRAME_MS
+
+
+def test_garbage_weights_fall_back_to_uniform():
+    assert frame_ms_sequence("idle", 6, ["a", None, 1, 1, 1, 1]) == [800.0] * 6
+    assert frame_ms_sequence("idle", 6, [0, 0, 0, 0, 0, 0]) == [800.0] * 6
+
+
+def test_the_cli_quantises_a_quick_frame_to_a_single_tick():
+    seq = frame_ms_sequence("idle", 6, [1, 1, 1, 1, 0.2, 1])
+
+    assert ticks_for("idle", 6, CLI_TICK_S, frame_ms=seq[4]) == 1
+    assert ticks_for("idle", 6, CLI_TICK_S, frame_ms=seq[0]) == 5

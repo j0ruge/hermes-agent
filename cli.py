@@ -2916,6 +2916,7 @@ class HermesCLI(CLIProcessNotificationsMixin, CLIAgentSetupMixin, CLICommandsMix
         self._pet_kitty_cache: dict = {}
         self._pet_kitty_image_id = self._pet_frame_idx = self._pet_paint_idx = 0
         self._pet_tick_wait = 0
+        self._pet_frame_weights: dict = {}
         self._pet_anim_state: str = ""
         self._pet_lock = threading.Lock()
         self._pet_cfg_checked = self._pet_event_until = 0.0

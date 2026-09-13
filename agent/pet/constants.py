@@ -34,6 +34,11 @@ STATE_LOOP_MS: dict[str, int] = {"idle": IDLE_LOOP_MS}
 # a slideshow, not a breath.
 MAX_FRAME_MS = 1000
 
+# Floor for one frame. A row may declare that some frames are quick (a blink is
+# an event of ~150ms, not a beat of the breath), but below a couple of terminal
+# repaints the frame simply never reaches the eye.
+MIN_FRAME_MS = 120
+
 
 def loop_ms_for(state: "PetState | str") -> int:
     """Full-loop duration for *state*, falling back to the baseline.

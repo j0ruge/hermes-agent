@@ -1252,6 +1252,7 @@ def _pet_kitty_cells(pet, pet_cfg: dict, state: str, scale: float) -> dict | Non
     return {"graphics": "kitty", "imageId": image_id, "color": render.kitty_color_hex(image_id),
             "cols": payload["cols"], "rows": payload["rows"], "placeholder": payload["placeholder"],
             "frames": payload["frames"], "frameMs": state_module.frame_interval_ms(state, len(payload["frames"])),
+            "frameMsList": state_module.frame_ms_sequence(state, len(payload["frames"]), pet.frame_weights.get(state)),
             "scale": scale}
 
 
@@ -1278,6 +1279,7 @@ def _(rid, params: dict) -> dict:
     frames = [[[[*top, *bottom] for (top, bottom) in row] for row in renderer.cells(state, i, cols=cols)]
               for i in range(count)]
     return _ok(rid, {**base, "cols": cols, "frameMs": state_module.frame_interval_ms(state, count), "frames": frames,
+                     "frameMsList": state_module.frame_ms_sequence(state, count, pet.frame_weights.get(state)),
                      "scale": scale})
 
 
