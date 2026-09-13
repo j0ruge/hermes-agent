@@ -7,7 +7,7 @@ TUI and Desktop (TS mirror of this priority order) feed it the signals they trac
 from __future__ import annotations
 
 from collections.abc import Iterable
-from typing import Any
+from typing import Any, NamedTuple
 
 from agent.pet.constants import PetState
 
@@ -55,3 +55,46 @@ def derive_pet_state(
         (busy, PetState.RUN),
     )
     return next((state for flag, state in ranked if flag), PetState.IDLE)
+
+
+# Rows that play once and then go quiet. ``idle`` is the resting pose: it holds
+# the corner of the screen precisely when nothing is happening, so looping it
+# turns into a permanent flicker in the user's periphery over a long session.
+# Every other row is a live read-out of what the agent is doing and keeps
+# cycling for as long as that state holds. Mirrored in the TUI's
+# ``ui-tui/src/app/petAnimation.ts``.
+ONE_SHOT_STATES: frozenset[str] = frozenset({PetState.IDLE})
+
+
+class PetFrameStep(NamedTuple):
+    """What a render loop should do on this tick."""
+
+    index: int | None
+    """Frame to paint now, or ``None`` while this row's frames are still loading."""
+
+    cursor: int
+    """Cursor to carry into the next call."""
+
+    animating: bool
+    """``False`` once the row has settled — stop advancing and stop repainting."""
+
+
+def next_frame_step(state: str, cursor: int, frame_count: int) -> PetFrameStep:
+    """Resolve one animation tick.
+
+    A one-shot row walks ``0..n-1``, paints the first frame once more and settles
+    there, so the pet rests on frame one rather than freezing on the last frame of
+    the cycle. Re-entering the state resets the cursor, which is what buys it a
+    fresh single cycle; holding the state costs nothing after it settles.
+    """
+    if frame_count < 1:
+        return PetFrameStep(None, cursor, True)
+
+    if state not in ONE_SHOT_STATES:
+        index = cursor % frame_count
+        return PetFrameStep(index, index + 1, True)
+
+    if cursor < frame_count:
+        return PetFrameStep(cursor, cursor + 1, True)
+
+    return PetFrameStep(0, frame_count, False)
