@@ -13,6 +13,7 @@ import threading
 import time
 
 from agent.pet import render as pet_render
+from agent.pet.state import next_frame_step
 from hermes_cli.banner import _format_context_length
 from typing import Any, Dict, Optional
 
@@ -699,7 +700,8 @@ class CLIStatusBarMixin:
                     self._pet_kitty_cache.clear()
                     self._pet_kitty_pending = ""
                     self._pet_kitty_image_id = pet_render.kitty_image_id(pet.slug)
-                    self._pet_frame_idx = 0
+                    self._pet_frame_idx = self._pet_paint_idx = 0
+                    self._pet_anim_state = ""
                 self._pet_enabled = True
         except Exception:
             with self._pet_lock:
@@ -805,7 +807,7 @@ class CLIStatusBarMixin:
         with self._pet_lock:
             if self._pet_renderer is not None and self._pet_renderer.mode == "kitty":
                 frames = payload["frames"]
-                self._pet_kitty_pending = frames[self._pet_frame_idx % len(frames)]
+                self._pet_kitty_pending = frames[self._pet_paint_idx % len(frames)]
 
     def _pet_flush_kitty_frame(self, app) -> None:
         """Write a queued APC after prompt_toolkit has finished its screen diff."""
@@ -849,7 +851,7 @@ class CLIStatusBarMixin:
             grids = self._pet_frames_for(state)
             if not grids:
                 return []
-            grid = grids[self._pet_frame_idx % len(grids)]
+            grid = grids[self._pet_paint_idx % len(grids)]
 
         def _hex(r, g, b):
             return f"#{r:02x}{g:02x}{b:02x}"
@@ -884,6 +886,41 @@ class CLIStatusBarMixin:
             grids = self._pet_frames_for(state)
             return len(grids[0]) if grids and grids[0] else 0
 
+    def _pet_anim_tick(self) -> bool:
+        """Advance one animation frame. True when the pane needs repainting.
+
+        The policy is shared with the TUI (``agent.pet.state.next_frame_step``):
+        ``idle`` plays one cycle and settles on its first frame, every other row
+        keeps cycling. A settled pet returns False forever after, so a resting
+        mascot costs no repaints at all — that quiet is the whole point, since
+        ``idle`` is on screen precisely when nothing is happening.
+        """
+        state = self._derive_pet_state()
+        with self._pet_lock:
+            kitty = self._pet_renderer is not None and self._pet_renderer.mode == "kitty"
+        if kitty:
+            # Takes _pet_lock itself, so it cannot run under the one below.
+            payload = self._pet_kitty_payload_for(state)
+            count = len(payload.get("frames") or ()) if payload else 0
+        else:
+            with self._pet_lock:
+                count = len(self._pet_frames_for(state))
+
+        with self._pet_lock:
+            changed = state != self._pet_anim_state
+            if changed:
+                self._pet_anim_state = state
+                self._pet_frame_idx = 0
+            step = next_frame_step(state, self._pet_frame_idx, count)
+            self._pet_frame_idx = step.cursor
+            if step.index is not None:
+                changed = changed or step.index != self._pet_paint_idx
+                self._pet_paint_idx = step.index
+
+        if changed and kitty:
+            self._pet_queue_kitty_frame(state)
+        return changed
+
     def _pet_anim_loop(self) -> None:
         """Advance the frame + invalidate on a timer while a pet is enabled."""
         while self._pet_anim_running:
@@ -897,11 +934,8 @@ class CLIStatusBarMixin:
                 self._pet_resolve_config()
             if not self._pet_enabled:
                 continue
-            with self._pet_lock:
-                self._pet_frame_idx += 1
-                kitty = self._pet_renderer is not None and self._pet_renderer.mode == "kitty"
-            if kitty:
-                self._pet_queue_kitty_frame()
+            if not self._pet_anim_tick():
+                continue
             app = getattr(self, "_app", None)
             if app is not None:
                 try:

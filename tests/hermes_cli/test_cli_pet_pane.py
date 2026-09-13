@@ -31,7 +31,7 @@ def boba_like(tmp_path, monkeypatch):
     for r in range(rows):
         color = (20 + r * 25, 60, 120, 255)
         for c in range(cols):
-            block = Image.new("RGBA", (FRAME_W, FRAME_H), color)
+            block = Image.new("RGBA", (FRAME_W, FRAME_H), (color[0], color[1] + c * 20, color[2], 255))
             sheet.paste(block, (c * FRAME_W, r * FRAME_H))
 
     pet_dir = store.pets_dir() / "boba"
@@ -57,6 +57,8 @@ def _make_cli():
     cli_obj._pet_kitty_image_id = 0
     cli_obj._pet_kitty_pending = ""
     cli_obj._pet_frame_idx = 0
+    cli_obj._pet_paint_idx = 0
+    cli_obj._pet_anim_state = ""
     cli_obj._agent_running = False
     # Transient-beat + reasoning state (set by HermesCLI.__init__ in production).
     cli_obj._pet_event = ""
@@ -263,3 +265,101 @@ def test_force_full_redraw_requeues_kitty_frame(boba_like, monkeypatch):
     cli_obj._force_full_redraw()
 
     assert cli_obj._pet_kitty_pending.startswith("\x1b_G")
+
+
+# ── animation loop ────────────────────────────────────────────────────────
+#
+# `idle` holds the pane while nothing happens, so looping it forever is a
+# permanent flicker in the corner of the screen. These drive one tick at a time
+# (the loop body without its `time.sleep`) and read back the frame that actually
+# reached the terminal.
+
+
+def _kitty_cli(slug="boba"):
+    from agent.pet import render
+
+    cli_obj = _make_cli()
+    pet = store.load_pet(slug)
+    assert pet is not None
+    cli_obj._pet_renderer = PetRenderer(str(pet.spritesheet), mode="kitty", scale=0.4)
+    cli_obj._pet_slug = slug
+    cli_obj._pet_kitty_image_id = render.kitty_image_id(slug)
+    cli_obj._pet_enabled = True
+    return cli_obj
+
+
+def _transmitted(cli_obj, state, ticks):
+    """Frame indices actually transmitted over `ticks` ticks, oldest first."""
+    frames = cli_obj._pet_kitty_payload_for(state)["frames"]
+    painted = []
+    for _ in range(ticks):
+        if cli_obj._pet_anim_tick():
+            painted.append(frames.index(cli_obj._pet_kitty_pending))
+    return painted
+
+
+def test_idle_plays_one_cycle_then_rests_on_the_first_frame(boba_like):
+    cli_obj = _kitty_cli()
+    count = len(cli_obj._pet_kitty_payload_for("idle")["frames"])
+
+    assert _transmitted(cli_obj, "idle", count + 1) == list(range(count)) + [0]
+
+
+def test_idle_never_restarts_however_long_the_agent_sits_still(boba_like):
+    cli_obj = _kitty_cli()
+    count = len(cli_obj._pet_kitty_payload_for("idle")["frames"])
+
+    painted = _transmitted(cli_obj, "idle", count * 20)
+
+    assert painted == list(range(count)) + [0]
+
+
+def test_a_settled_pet_asks_for_no_repaints(boba_like):
+    cli_obj = _kitty_cli()
+    count = len(cli_obj._pet_kitty_payload_for("idle")["frames"])
+    for _ in range(count + 1):
+        cli_obj._pet_anim_tick()
+
+    assert [cli_obj._pet_anim_tick() for _ in range(5)] == [False] * 5
+
+
+def test_an_active_row_keeps_looping(boba_like):
+    cli_obj = _kitty_cli()
+    cli_obj._agent_running = True
+    count = len(cli_obj._pet_kitty_payload_for("run")["frames"])
+
+    painted = _transmitted(cli_obj, "run", count * 2)
+
+    assert painted == list(range(count)) * 2
+
+
+def test_falling_back_to_idle_buys_exactly_one_fresh_cycle(boba_like):
+    cli_obj = _kitty_cli()
+    count = len(cli_obj._pet_kitty_payload_for("idle")["frames"])
+    _transmitted(cli_obj, "idle", count * 3)
+
+    cli_obj._agent_running = True
+    _transmitted(cli_obj, "run", 3)
+    cli_obj._agent_running = False
+
+    assert _transmitted(cli_obj, "idle", count * 3) == list(range(count)) + [0]
+
+
+def test_half_block_path_also_rests_on_the_first_frame(boba_like):
+    cli_obj = _make_cli()
+    cli_obj._pet_renderer = PetRenderer(
+        str(store.load_pet("boba").spritesheet), mode="unicode", scale=0.4, unicode_cols=14
+    )
+    cli_obj._pet_cols = 14
+    cli_obj._pet_enabled = True
+
+    def styles():
+        return tuple(style for style, text in cli_obj._pet_fragments() if text != "\n")
+
+    seen = []
+    for _ in range(40):
+        if cli_obj._pet_anim_tick():
+            seen.append(styles())
+
+    assert len(seen) > 2, "expected the idle row to animate at least once"
+    assert seen[-1] == seen[0], "settled on a frame other than the first"
