@@ -14,6 +14,7 @@ import pytest
 from agent.pet import store
 from agent.pet.constants import FRAME_H, FRAME_W
 from agent.pet.render import PetRenderer
+from agent.pet.state import frame_ms_sequence, ticks_for
 from cli import HermesCLI
 
 
@@ -31,7 +32,7 @@ def boba_like(tmp_path, monkeypatch):
     for r in range(rows):
         color = (20 + r * 25, 60, 120, 255)
         for c in range(cols):
-            block = Image.new("RGBA", (FRAME_W, FRAME_H), color)
+            block = Image.new("RGBA", (FRAME_W, FRAME_H), (color[0], color[1] + c * 20, color[2], 255))
             sheet.paste(block, (c * FRAME_W, r * FRAME_H))
 
     pet_dir = store.pets_dir() / "boba"
@@ -57,6 +58,9 @@ def _make_cli():
     cli_obj._pet_kitty_image_id = 0
     cli_obj._pet_kitty_pending = ""
     cli_obj._pet_frame_idx = 0
+    cli_obj._pet_paint_idx = 0
+    cli_obj._pet_anim_state = ""
+    cli_obj._pet_frame_weights = {}
     cli_obj._agent_running = False
     # Transient-beat + reasoning state (set by HermesCLI.__init__ in production).
     cli_obj._pet_event = ""
@@ -263,3 +267,134 @@ def test_force_full_redraw_requeues_kitty_frame(boba_like, monkeypatch):
     cli_obj._force_full_redraw()
 
     assert cli_obj._pet_kitty_pending.startswith("\x1b_G")
+
+
+# ── animation loop ────────────────────────────────────────────────────────
+#
+# Toda linha cicla; o que separa `idle` das outras é a cadência. A thread do
+# painel acorda a cada 160ms para reagir depressa à troca de estado, e cada
+# estado só troca de quadro quando a sua cadência vence — contada em tiques
+# inteiros, senão os 183ms dos estados rápidos arredondariam para 320ms e
+# dobrariam a volta deles. Estes testes dirigem tique a tique, sem relógio.
+
+
+def _kitty_cli(slug="boba"):
+    from agent.pet import render
+
+    cli_obj = _make_cli()
+    pet = store.load_pet(slug)
+    assert pet is not None
+    cli_obj._pet_renderer = PetRenderer(str(pet.spritesheet), mode="kitty", scale=0.4)
+    cli_obj._pet_slug = slug
+    cli_obj._pet_kitty_image_id = render.kitty_image_id(slug)
+    cli_obj._pet_enabled = True
+    return cli_obj
+
+
+def _transmitted(cli_obj, state, ticks):
+    """Frame indices actually transmitted over `ticks` ticks, oldest first."""
+    frames = cli_obj._pet_kitty_payload_for(state)["frames"]
+    painted = []
+    for _ in range(ticks):
+        if cli_obj._pet_anim_tick():
+            painted.append(frames.index(cli_obj._pet_kitty_pending))
+    return painted
+
+
+def test_a_live_readout_row_advances_on_every_tick(boba_like):
+    # A cadência de sempre: um quadro por tique de 160ms. Se isto quebrar, os
+    # estados que reportam trabalho ficaram mais lentos sem ninguém pedir.
+    cli_obj = _kitty_cli()
+    cli_obj._agent_running = True
+    count = len(cli_obj._pet_kitty_payload_for("run")["frames"])
+
+    assert _transmitted(cli_obj, "run", count * 2) == list(range(count)) * 2
+
+
+def test_idle_breathes_across_several_ticks_per_frame(boba_like):
+    cli_obj = _kitty_cli()
+    count = len(cli_obj._pet_kitty_payload_for("idle")["frames"])
+    passo = ticks_for("idle", count, cli_obj._PET_FRAME_INTERVAL)
+
+    assert passo > 1, "idle deveria segurar cada quadro por vários tiques"
+    # O primeiro tique pinta o quadro 0 (entrada no estado); daí em diante um
+    # quadro a cada `passo` tiques.
+    assert _transmitted(cli_obj, "idle", 1 + passo * 3) == [0, 1, 2, 3]
+
+
+def test_idle_keeps_looping_forever(boba_like):
+    cli_obj = _kitty_cli()
+    count = len(cli_obj._pet_kitty_payload_for("idle")["frames"])
+    passo = ticks_for("idle", count, cli_obj._PET_FRAME_INTERVAL)
+
+    painted = _transmitted(cli_obj, "idle", 1 + passo * count * 2)
+
+    assert painted == [0] + [(i + 1) % count for i in range(count * 2)]
+
+
+def test_a_state_change_repaints_on_the_next_tick(boba_like):
+    # Respirar devagar não pode atrasar a reação: o pet tem de mudar de linha no
+    # tique seguinte, não depois de esperar a cadência longa do idle vencer.
+    cli_obj = _kitty_cli()
+    cli_obj._pet_anim_tick()
+    cli_obj._pet_anim_tick()
+
+    cli_obj._agent_running = True
+
+    assert cli_obj._pet_anim_tick() is True
+    assert cli_obj._pet_tick_wait == 0
+
+
+def test_rebuilding_the_pet_clears_the_cadence_counter(boba_like):
+    from hermes_cli.config import load_config, save_config
+
+    cli_obj = _kitty_cli()
+    cli_obj._pet_anim_tick()
+    cli_obj._pet_tick_wait = 3
+
+    cfg = load_config()
+    cfg.setdefault("display", {}).setdefault("pet", {}).update({"enabled": True, "slug": "boba"})
+    save_config(cfg)
+    cli_obj._pet_resolve_config()
+
+    assert cli_obj._pet_tick_wait == 0
+
+
+def test_half_block_path_animates_too(boba_like):
+    cli_obj = _make_cli()
+    cli_obj._pet_renderer = PetRenderer(
+        str(store.load_pet("boba").spritesheet), mode="unicode", scale=0.4, unicode_cols=14
+    )
+    cli_obj._pet_cols = 14
+    cli_obj._pet_enabled = True
+    cli_obj._agent_running = True
+
+    def styles():
+        return tuple(style for style, text in cli_obj._pet_fragments() if text != "\n")
+
+    seen = []
+    for _ in range(6):
+        if cli_obj._pet_anim_tick():
+            seen.append(styles())
+
+    assert len(set(seen)) > 1, "o caminho de meio-blocos deveria trocar de quadro"
+
+
+def test_a_frame_the_pet_declares_as_quick_holds_a_single_tick(boba_like):
+    """Uma piscada é um evento de ~150ms; segurá-la um beat inteiro de
+    respiração leria como sono. O peso na `pet.json` diz que aquele quadro é
+    rápido, e a volta continua durando o que `STATE_LOOP_MS` manda."""
+    cli_obj = _kitty_cli()
+    count = len(cli_obj._pet_kitty_payload_for("idle")["frames"])
+    rapido = count - 2
+    pesos = [1.0] * count
+    pesos[rapido] = 0.2
+    cli_obj._pet_frame_weights = {"idle": pesos}
+
+    longo = ticks_for("idle", count, cli_obj._PET_FRAME_INTERVAL,
+                      frame_ms=frame_ms_sequence("idle", count, pesos)[0])
+    painted = _transmitted(cli_obj, "idle", 1 + longo * rapido + 1 + longo)
+
+    # Chega ao quadro rápido gastando `longo` tiques por quadro, e sai dele no
+    # tique seguinte — o que o ritmo uniforme não permitiria.
+    assert painted[: rapido + 2] == list(range(rapido + 2))

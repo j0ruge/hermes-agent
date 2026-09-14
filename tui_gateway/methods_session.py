@@ -1239,6 +1239,7 @@ def _(rid, params: dict) -> dict:
 def _pet_kitty_cells(pet, pet_cfg: dict, state: str, scale: float) -> dict | None:
     """kitty payload for a TTY that speaks it (dashboard PTY falls through); only kitty is grid-safe in Ink."""
     from agent.pet import constants, render
+    from agent.pet import state as state_module
     from agent.pet.render import PetRenderer
     configured = str(pet_cfg.get("render_mode", "auto") or "auto").lower()
     if (render.detect_terminal_graphics() if configured in ("", "auto") else configured) != "kitty":
@@ -1250,7 +1251,8 @@ def _pet_kitty_cells(pet, pet_cfg: dict, state: str, scale: float) -> dict | Non
         return None
     return {"graphics": "kitty", "imageId": image_id, "color": render.kitty_color_hex(image_id),
             "cols": payload["cols"], "rows": payload["rows"], "placeholder": payload["placeholder"],
-            "frames": payload["frames"], "frameMs": constants.LOOP_MS / max(1, len(payload["frames"]) or 1),
+            "frames": payload["frames"], "frameMs": state_module.frame_interval_ms(state, len(payload["frames"])),
+            "frameMsList": state_module.frame_ms_sequence(state, len(payload["frames"]), pet.frame_weights.get(state)),
             "scale": scale}
 
 
@@ -1258,6 +1260,7 @@ def _pet_kitty_cells(pet, pet_cfg: dict, state: str, scale: float) -> dict | Non
 def _(rid, params: dict) -> dict:
     """Half-block cell frames (``[tr,tg,tb,ta, br,bg,bb,ba]``) for one pet ``state``; ``cols``, ``graphics``."""
     from agent.pet import constants, store
+    from agent.pet import state as state_module
     from agent.pet.render import PetRenderer
     pet_cfg = _pet_display_cfg()
     pet = None
@@ -1275,7 +1278,8 @@ def _(rid, params: dict) -> dict:
     count = renderer.frame_count(state) or 1
     frames = [[[[*top, *bottom] for (top, bottom) in row] for row in renderer.cells(state, i, cols=cols)]
               for i in range(count)]
-    return _ok(rid, {**base, "cols": cols, "frameMs": constants.LOOP_MS / max(1, count), "frames": frames,
+    return _ok(rid, {**base, "cols": cols, "frameMs": state_module.frame_interval_ms(state, count), "frames": frames,
+                     "frameMsList": state_module.frame_ms_sequence(state, count, pet.frame_weights.get(state)),
                      "scale": scale})
 
 
